@@ -196,24 +196,31 @@ class StrictClusterPipeline(StrictRedisCluster):
                     nodes[node_name].append(PipelineCommand(['ASKING']))
                 nodes[node_name].append(c)
 
-            try:
-                # send the commands in sequence.
-                # we only write to all the open sockets for each node, we don't read
-                # this allows us to flush all the requests out across the network essentially in parallel
-                # so that we can read them all in parallel as they come back.
-                # we dont' multiplex on the sockets as they come available, but that shouldn't make too much difference.
-                node_commands = nodes.values()
-                for n in node_commands:
-                    n.write()
+            # send the commands in sequence.
+            # we  write to all the open sockets for each node first, before reading anything
+            # this allows us to flush all the requests out across the network essentially in parallel
+            # so that we can read them all in parallel as they come back.
+            # we dont' multiplex on the sockets as they come available, but that shouldn't make too much difference.
+            node_commands = nodes.values()
+            for n in node_commands:
+                n.write()
 
-                for n in node_commands:
-                    n.read()
+            for n in node_commands:
+                n.read()
 
-            finally:
-                # release all of the redis connections we allocated earlier back into the connection pool.
-                for n in nodes.values():
-                    self.connection_pool.release(n.connection)
-                del nodes
+            # release all of the redis connections we allocated earlier back into the connection pool.
+            # we used to do this step as part of a try/finally block, but it is really dangerous to
+            # release connections back into the pool if for some reason the socket has data still left in it
+            # from a previous operation. The write and read operations already have try/catch around them for
+            # all known types of errors including connection and socket level errors.
+            # So if we hit an exception, something really bad happened and putting any of
+            # these connections back into the pool is a very bad idea.
+            # the socket might have unread buffer still sitting in it, and then the
+            # next time we read from it we pass the buffered result back from a previous
+            # command and every single request after to that connection will always get
+            # a mismatched result. (not just theoretical, I saw this happen on production x.x).
+            for n in nodes.values():
+                self.connection_pool.release(n.connection)
 
             # if the response isn't an exception it is a valid response from the node
             # we're all done with that command, YAY!
@@ -452,6 +459,11 @@ class NodeCommands(object):
         connection = self.connection
         commands = self.commands
         try:
+            # We are going to clobber the commands with the write, so go ahead
+            # and ensure that nothing is sitting there from a previous run.
+            for c in commands:
+                c.result = None
+
             connection.send_packed_command(connection.pack_commands([c.args for c in commands]))
         except ConnectionError as e:
             for c in commands:
@@ -462,7 +474,24 @@ class NodeCommands(object):
         """
         connection = self.connection
         for c in self.commands:
-            try:
-                c.result = self.parse_response(connection, c.args[0], **c.options)
-            except RedisError:
-                c.result = sys.exc_info()[1]
+
+            # if there is a result on this command, it means we ran into an exception
+            # like a connection error. Trying to parse a response on a connection that
+            # is no longer open will result in a connection error raised by redis-py.
+            # but redis-py doesn't check in parse_response that the sock object is
+            # still set and if you try to read from a closed connection, it will
+            # result in an AttributeError because it will do a readline() call on None.
+            # This can have all kinds of nasty side-effects.
+            # Treating this case as a connection error is fine because it will dump
+            # the connection object back into the pool and on the next write, it will
+            # explicitly open the connection and all will be well.
+            if c.result is None:
+                try:
+                    c.result = self.parse_response(connection, c.args[0], **c.options)
+                except RedisError:
+                    c.result = sys.exc_info()[1]
+                except AttributeError as e:
+                    if 'readline' in str(e):
+                        c.result = ConnectionError('error reading response')
+                    else:
+                        raise
